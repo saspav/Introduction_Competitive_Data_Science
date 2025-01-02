@@ -10,7 +10,6 @@ from print_time import print_time, print_msg
 
 __import__("warnings").filterwarnings('ignore')
 
-file_urls = WORK_PATH.joinpath('file_urls.feather')
 
 rus = 'АЕКМНОРСТУХВ'
 eng = 'AEKMHOPCTYXB'

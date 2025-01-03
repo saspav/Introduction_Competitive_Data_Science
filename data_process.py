@@ -938,4 +938,4 @@ if __name__ == "__main__":
     #
     # print(set(train_data.columns) - set(test_data.columns))
 
-    merge_submits(max_num=125, submit_prefix='xb_', use_proba=True)
+    # merge_submits(max_num=125, submit_prefix='xb_', use_proba=True)

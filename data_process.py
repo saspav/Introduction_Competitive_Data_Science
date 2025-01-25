@@ -8,6 +8,7 @@ import joblib
 import featuretools as ft
 from woodwork.logical_types import Age, Categorical, Datetime
 
+from glob import glob
 from copy import deepcopy
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -19,7 +20,8 @@ from sklearn.preprocessing import LabelEncoder, normalize
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures, OneHotEncoder
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, GridSearchCV
-from sklearn.metrics import f1_score, roc_auc_score, classification_report
+from sklearn.metrics import f1_score, roc_auc_score, mean_squared_error, mean_absolute_error
+from sklearn.metrics import r2_score, mean_squared_log_error, explained_variance_score
 
 from df_addons import memory_compression
 from print_time import print_time, print_msg
@@ -43,6 +45,7 @@ PREDICTIONS_DIR = WORK_PATH.joinpath('predictions')
 PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 MODELS_LOGS = WORK_PATH.joinpath('scores_local.logs')
+MODELS_LOGS_REG = WORK_PATH.joinpath('scores_local_reg.logs')
 
 if not DATASET_PATH.exists():
     DATASET_PATH = Path('.')
@@ -64,14 +67,16 @@ def get_max_num(log_file=None):
 
     if not log_file.is_file():
         with open(log_file, mode='a') as log:
-            log.write('num;mdl;fold;auc_macro;auc_micro;auc_wght;f1_macro;f1_micro;f1_wght;'
-                      'tst_score;model_columns;exclude_columns;cat_columns;comment\n')
+            log.write('num;mdl;fold;mdl_score;auc_macro;auc_micro;auc_wght;f1_macro;f1_micro;'
+                      'f1_wght;tst_score;model_columns;exclude_columns;cat_columns;comment\n')
         max_num = 0
     else:
-        df = pd.read_csv(log_file, sep=';')
-        # df.num = df.index + 1
-        max_num = df.num.max()
-    return max_num if max_num else 0
+        df = pd.read_csv(log_file, sep=';', index_col=False)
+        if df.empty:
+            max_num = 0
+        else:
+            max_num = df.num.max()
+    return int(max_num) if max_num is not None else 0
 
 
 def clean_column_name(col_name):
@@ -386,22 +391,31 @@ class DataTransform:
             df.drop(columns=col_to_drop, inplace=True)
         return df
 
-    def make_agg_data(self, remake_file=False, use_featuretools=False):
+    def make_agg_data(self, remake_file=False, use_featuretools=False,
+                      file_with_target_class=None):
         """
         Подсчет разных агрегированных статистик
-        :param remake_file:
-        :param use_featuretools:
-        :return:
+        :param remake_file: Формируем файлы снова или читаем с диска
+        :param use_featuretools: Используем модуль featuretools
+        :param file_with_target_class: Используем предсказания классификатора о поломке машины
+        :return: ДФ трейна и теста с агрегированными данными
         """
         aggregate_path_file = None
 
         if self.aggregate_path_file:
-            aggregate_path_file = WORK_PATH.joinpath(self.aggregate_path_file)
+            if (file_with_target_class is not None and
+                    PREDICTIONS_DIR.joinpath(file_with_target_class).is_file()):
+                aggregate_path_file = WORK_PATH.joinpath(
+                    self.aggregate_path_file.replace('.pkl', '_reg.pkl'))
+            else:
+                aggregate_path_file = WORK_PATH.joinpath(self.aggregate_path_file)
 
         if self.aggregate_path_file and aggregate_path_file.is_file() and not remake_file:
             start_time = print_msg('Читаю подготовленные данные...')
             with open(aggregate_path_file, 'rb') as in_file:
                 train_df, test_df = joblib.load(in_file)
+            if file_with_target_class is None:
+                test_df.drop(columns=['target_class'], inplace=True, errors='ignore')
             print_time(start_time)
             return train_df, test_df
 
@@ -469,7 +483,6 @@ class DataTransform:
             # Добавим целевые признаки из трейна
             train_df = train_df.merge(train[['car_id', 'target_reg', 'target_class']],
                                       on=['car_id'], how='left')
-
         else:
             # Количество: уникальных водителей, использования машины
             grp_car = df.groupby(['car_id', 'model', 'car_type']).agg(
@@ -548,6 +561,12 @@ class DataTransform:
 
             train_df = train.merge(grp_car, on=['car_id', 'model', 'car_type'], how='left')
             test_df = test.merge(grp_car, on=['car_id', 'model', 'car_type'], how='left')
+
+        if PREDICTIONS_DIR.joinpath(file_with_target_class).is_file():
+            subm_df = pd.read_csv(PREDICTIONS_DIR.joinpath(file_with_target_class))
+            test_df = test_df.merge(subm_df, on='car_id', how='left')
+        else:
+            test_df.drop(columns=['target_class'], inplace=True, errors='ignore')
 
         print_time(start_time)
 
@@ -770,6 +789,74 @@ def make_predict(idx_fold, model, datasets, max_num=0, submit_prefix='cb_', labe
     return model_score, auc_macro, auc_micro, auc_wght, f1_macro, f1_micro, f1_wght, t_score
 
 
+def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_'):
+    """Предсказание для тестового датасета.
+    Расчет метрик для модели: roc_auc и взвешенная F1-мера на валидации
+    :param idx_fold: номер фолда при обучении
+    :param model: обученная модель
+    :param datasets: кортеж с тренировочной, валидационной и полной выборками
+    :param max_num: максимальный порядковый номер обучения моделей
+    :param submit_prefix: префикс для файла сабмита для каждой модели свой
+    :return: разные roc_auc и F1-мера
+    """
+    X_train, X_valid, y_train, y_valid, train, target, test_df, model_columns = datasets
+
+    features2drop = ['car_id']
+
+    test = test_df[model_columns].drop(columns=features2drop, errors='ignore').copy()
+
+    print('X_train.shape', X_train.shape)
+    print('train.shape', train.shape)
+    print('test.shape', test.shape)
+
+    # постфикс если было обучение на отдельных фолдах
+    nfld = f'_{idx_fold}' if idx_fold else ''
+
+    predict_valid = model.predict(X_valid)
+    predict_valid = np.where(predict_valid < 0, 0, predict_valid)
+    predict_test = model.predict(test)
+    predict_test = np.where(predict_test < 0, 0, predict_test)
+
+    # Сохранение предсказаний в файл
+    submit_csv = f'{submit_prefix}submit_{max_num:03}{nfld}{LOCAL_FILE}_reg.csv'
+    file_submit_csv = PREDICTIONS_DIR.joinpath(submit_csv)
+    submission = pd.DataFrame({'car_id': test_df['car_id'],
+                               'target_reg': predict_test.flatten()})
+    submission.to_csv(file_submit_csv, index=False)
+
+    t_score = 0
+
+    start_item = print_msg("Расчет scores...")
+    # Root Mean Squared Error
+    auc_macro = mean_squared_error(y_valid, predict_valid, squared=False)
+    # Mean Absolute Error
+    auc_micro = mean_absolute_error(y_valid, predict_valid)
+    # Mean Squared Error
+    auc_wght = mean_squared_error(y_valid, predict_valid, squared=True)
+    # R² Score
+    f1_macro = r2_score(y_valid, predict_valid)
+    # Mean Squared Logarithmic Error
+    f1_micro = mean_squared_log_error(y_valid, predict_valid)
+    # Explained Variance Score
+    f1_wght = explained_variance_score(y_valid, predict_valid)
+    print_time(start_item)
+
+    try:
+        if 'CatBoost' in model.__class__.__name__:
+            eval_metric = model.get_params()['eval_metric']
+            model_score = model.best_score_['validation'][eval_metric]
+        elif 'LGBM' in model.__class__.__name__:
+            model_score = model.best_score_['valid_0']['rmse']
+        elif 'XGB' in model.__class__.__name__:
+            model_score = model.best_score
+        else:
+            model_score = auc_macro
+    except:
+        model_score = 0
+
+    return model_score, auc_macro, auc_micro, auc_wght, f1_macro, f1_micro, f1_wght, t_score
+
+
 def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
                     comment_dict=None, clf_lr=None, log_file=MODELS_LOGS):
     """
@@ -782,6 +869,7 @@ def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
     :param info_cols: информативные колонки
     :param comment_dict: комментарии
     :param clf_lr: список из learning_rate моделей
+    :param log_file: полный путь к файлу с логами обучения моделей
     :return:
     """
     m_score, auc_macro, auc_micro, auc_wght, f1_macro, f1_micro, f1_wght, score = valid_scores
@@ -794,14 +882,14 @@ def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
         comment = deepcopy(comment_dict)
 
     model_clf_lr = feature_imp = None
-    if model.__class__.__name__ == 'CatBoostClassifier':
+    if 'CatBoost' in model.__class__.__name__:
         model_clf_lr = model.get_all_params().get('learning_rate', 0)
         feature_imp = model.feature_importances_
 
-    elif model.__class__.__name__ == 'LGBMClassifier':
+    elif 'LGBM' in model.__class__.__name__:
         model_clf_lr = model.get_params().get('learning_rate', 0)
 
-    elif model.__class__.__name__ == 'XGBClassifier':
+    elif 'XGB' in model.__class__.__name__:
         model_clf_lr = model.get_params().get('learning_rate', 0)
 
     if feature_imp is not None:
@@ -824,15 +912,15 @@ def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
     prf = prf.strip('_')
 
     with open(log_file, mode='a') as log:
-        # log.write('num;mdl;fold;auc_macro;auc_micro;auc_wght;f1_macro;f1_micro;f1_wght;'
-        #           'tst_score;model_columns;exclude_columns;cat_columns;comment\n')
+        # log.write('num;mdl;fold;mdl_score;auc_macro;auc_micro;auc_wght;f1_macro;f1_micro;'
+        #           'f1_wght;tst_score;model_columns;exclude_columns;cat_columns;comment\n')
         log.write(f'{max_num};{prf};{idx_fold};{m_score:.6f};{auc_macro:.6f};{auc_micro:.6f};'
                   f'{auc_wght:.6f};{f1_macro:.6f};{f1_micro:.6f};{f1_wght:.6f};{score:.6f};'
                   f'{model_columns};{exclude_columns};{cat_columns};{comment}\n')
 
 
 def merge_submits(max_num=0, submit_prefix='cb_', num_folds=5, exclude_folds=None,
-                  use_proba=False):
+                  use_proba=False, post_fix=''):
     """
     Объединение сабмитов
     :param max_num: номер итерации модели или список файлов, или список номеров сабмитов
@@ -841,6 +929,7 @@ def merge_submits(max_num=0, submit_prefix='cb_', num_folds=5, exclude_folds=Non
     :param exclude_folds: список списков для исключения фолдов из объединения:
                           длина списка exclude_folds должна быть равна длине списка max_num
     :param use_proba: использовать файлы с предсказаниями вероятностей
+    :param post_fix: постфикс для регрессии
     :return: None
     """
     if use_proba:
@@ -851,7 +940,7 @@ def merge_submits(max_num=0, submit_prefix='cb_', num_folds=5, exclude_folds=Non
     submits = pd.DataFrame()
     if isinstance(max_num, int):
         for nfld in range(1, num_folds + 1):
-            submit_csv = f'{submit_prefix}submit{prob}_{max_num:03}_{nfld}{LOCAL_FILE}.csv'
+            submit_csv = f'{submit_prefix}submit{prob}_{max_num:03}_{nfld}{LOCAL_FILE}{post_fix}.csv'
             df = pd.read_csv(PREDICTIONS_DIR.joinpath(submit_csv), index_col='car_id')
             if use_proba:
                 df.columns = [f'{col}_{nfld}' for col in df.columns]
@@ -911,11 +1000,20 @@ def merge_submits(max_num=0, submit_prefix='cb_', num_folds=5, exclude_folds=Non
         # Получение имени класса поломки по максимуму из классов
         submits['target_class'] = submits.idxmax(axis=1)
     else:
-        # Нахождение моды по строкам
-        submits['target_class'] = submits.mode(axis=1)[0]
+        if not post_fix:
+            # Нахождение моды по строкам
+            submits['target_class'] = submits.mode(axis=1)[0]
+        else:
+            # Нахождение среднего по строкам
+            submits['target_reg'] = submits.mean(axis=1)
+            # # Нахождение медианы по строкам
+            # submits['target_reg'] = submits.median(axis=1)
 
-    submits_csv = f'{submit_prefix}submit_{max_num}{LOCAL_FILE}{prob}.csv'
-    submits[['target_class']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv))
+    submits_csv = f'{submit_prefix}submit_{max_num}{LOCAL_FILE}{prob}{post_fix}.csv'
+    if not post_fix:
+        submits[['target_class']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv))
+    else:
+        submits[['target_reg']].to_csv(PREDICTIONS_DIR.joinpath(submits_csv))
 
 
 if __name__ == "__main__":
@@ -926,7 +1024,8 @@ if __name__ == "__main__":
     # dts = DataTransform()
     #
     # # train_data, test_data = dts.make_agg_data(remake_file=True, use_featuretools=True)
-    # train_data, test_data = dts.make_agg_data(remake_file=True)
+    # train_data, test_data = dts.make_agg_data(remake_file=True,
+    #                                           file_with_target_class='cb_submit_074_local.csv')
     #
     # print(train_data.columns)
     #
@@ -938,4 +1037,9 @@ if __name__ == "__main__":
     #
     # print(set(train_data.columns) - set(test_data.columns))
 
-    # merge_submits(max_num=125, submit_prefix='xb_', use_proba=True)
+    # files = [Path(fil).name for fil in glob(str(PREDICTIONS_DIR.joinpath('merge')) + '/*.*')]
+    # print(files)
+    #
+    # merge_submits(max_num=files, submit_prefix='mg_', post_fix='_reg')
+
+    merge_submits(max_num=54, submit_prefix='cbm_', post_fix='_reg')

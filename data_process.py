@@ -805,9 +805,9 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_'):
 
     test = test_df[model_columns].drop(columns=features2drop, errors='ignore').copy()
 
-    print('X_train.shape', X_train.shape)
-    print('train.shape', train.shape)
-    print('test.shape', test.shape)
+    # print('X_train.shape', X_train.shape)
+    # print('train.shape', train.shape)
+    # print('test.shape', test.shape)
 
     # постфикс если было обучение на отдельных фолдах
     nfld = f'_{idx_fold}' if idx_fold else ''
@@ -826,7 +826,7 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_'):
 
     t_score = 0
 
-    start_item = print_msg("Расчет scores...")
+    # start_item = print_msg("Расчет scores...")
     # Root Mean Squared Error
     auc_macro = mean_squared_error(y_valid, predict_valid, squared=False)
     # Mean Absolute Error
@@ -839,7 +839,7 @@ def make_predict_reg(idx_fold, model, datasets, max_num=0, submit_prefix='cb_'):
     f1_micro = mean_squared_log_error(y_valid, predict_valid)
     # Explained Variance Score
     f1_wght = explained_variance_score(y_valid, predict_valid)
-    print_time(start_item)
+    # print_time(start_item)
 
     try:
         if 'CatBoost' in model.__class__.__name__:

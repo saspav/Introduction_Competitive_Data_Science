@@ -8,7 +8,7 @@ import torch
 
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder, MinMaxScaler
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
+from sklearn.preprocessing import FunctionTransformer, LabelEncoder, normalize, OrdinalEncoder
 # Вспомогательные блоки организации для пайплайна
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.compose import ColumnTransformer, make_column_selector
@@ -54,7 +54,7 @@ class CustomStackingRegressor:
         self.test_size = test_size
         self.cv_folds = cv_folds
         self.cv_folds_meta = cv_folds_meta
-        self.num_scaler = StandardScaler if num_scaler is None else num_scaler
+        self.scaler = StandardScaler if num_scaler is None else num_scaler
         self.models_to_scale = ['LinReg',
                                 'LogReg',
                                 'TabNetWork',
@@ -75,11 +75,15 @@ class CustomStackingRegressor:
         self.X_test_for_meta = None
         self.fitted_models = {model_name: [] for model_name, _ in estimators}
         self.final_model = None
+        self.show_min_output = kwargs.get('show_min_output', False)
         set_all_seeds(seed=self.random_state)
 
     def fit_model(self, model_name, base_model, split, n_fold=0):
         name_fold = f', фолд: {n_fold}/{self.cv_folds}' if n_fold else ''
-        print(f'Обучаю модель: {model_name}{name_fold}')
+
+        if self.show_min_output:
+            print(f'Обучаю модель: {model_name}{name_fold}')
+
         X_train, X_valid, y_train, y_valid = split
         model = clone(base_model)
         if model_name == "CatBoost":
@@ -112,7 +116,7 @@ class CustomStackingRegressor:
             return X_train, X_valid, y_train, y_valid
 
         # Трансформируем данные train_df
-        X_train_prep = self.preprocessor.transform(X_train)
+        X_train_prep = self.preprocessor.transform(X_train.copy())
 
         # Получаем имена новых колонок после трансформации
         num_columns_trn = self.num_columns
@@ -124,7 +128,7 @@ class CustomStackingRegressor:
         train_ = pd.DataFrame(X_train_prep, columns=model_columns_trn, index=X_train.index)
         valid_ = None
         if X_valid is not None:
-            X_valid_ = self.preprocessor.transform(X_valid)
+            X_valid_ = self.preprocessor.transform(X_valid.copy())
             valid_ = pd.DataFrame(X_valid_, columns=model_columns_trn, index=X_valid.index)
         if self.models_to_scale is None or model_name not in self.models_to_scale:
             # Признаки для этих моделей не нужно масштабировать
@@ -154,10 +158,14 @@ class CustomStackingRegressor:
             self.verbose = verbose
 
         categorical_transformer = Pipeline(steps=[
-            ("onehot", OneHotEncoder(handle_unknown="ignore"))])
+            ("onehot",
+             OneHotEncoder(dtype=int, handle_unknown="ignore"))])
+
         numerical_transformer = Pipeline(steps=[
-            ("scaler", self.num_scaler())
+            ("scaler",
+             FunctionTransformer(lambda Z: Z) if self.scaler is None else self.scaler())
         ])
+
         # соединим два предыдущих трансформера в один
         self.preprocessor = ColumnTransformer(transformers=[
             ("numerical", numerical_transformer, self.num_columns),
@@ -298,9 +306,6 @@ class CustomStackingRegressor:
             result = pd.DataFrame(data=predictions_array.mean(axis=1),
                                   columns=[predict_columns],
                                   index=self.X_test_for_meta.index)
-            # Преобразование в метку 0 / 1
-            result[predict_columns] = result[predict_columns].map(lambda z: int(z >= 0.5))
-
         else:
             split = train_test_split(XM, yM, test_size=self.test_size,
                                      stratify=self.stratified_target,
@@ -312,6 +317,7 @@ class CustomStackingRegressor:
             result[predict_columns] = self.final_model.predict(self.X_test_for_meta)
 
         self.X_test_for_meta[predict_columns] = result[predict_columns]
+
         if save_to_excel:
             self.X_test_for_meta.to_excel(WORK_PATH.joinpath('X_test_for_meta_pred.xlsx'))
 

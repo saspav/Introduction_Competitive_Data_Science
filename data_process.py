@@ -8,6 +8,7 @@ import joblib
 import featuretools as ft
 from woodwork.logical_types import Age, Categorical, Datetime
 
+from io import StringIO
 from glob import glob
 from copy import deepcopy
 from pathlib import Path
@@ -16,7 +17,9 @@ from tqdm import tqdm
 from calendar import monthrange
 from itertools import product
 
-from sklearn.preprocessing import LabelEncoder, normalize
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import FunctionTransformer, LabelEncoder, normalize
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures, OneHotEncoder
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, GridSearchCV
@@ -71,7 +74,11 @@ def get_max_num(log_file=None):
                       'f1_wght;tst_score;model_columns;exclude_columns;cat_columns;comment\n')
         max_num = 0
     else:
-        df = pd.read_csv(log_file, sep=';', index_col=False)
+        # Чтение файла как строки
+        with open(log_file, encoding='utf-8') as file:
+            file_rows = file.read()
+        # Удаление переносов строки в кривых строках и загрузка файла в ДФ
+        df = pd.read_csv(StringIO(file_rows.replace(',\n', ',')), sep=';', index_col=False)
         if df.empty:
             max_num = 0
         else:
@@ -90,7 +97,7 @@ def clean_column_name(col_name):
 
 class DataTransform:
     def __init__(self, use_catboost=True, numeric_columns=None, category_columns=None,
-                 drop_first=False, scaler=None, args_scaler=None):
+                 features2drop=None, scaler=None, args_scaler=None, **kwargs):
         """
         Преобразование данных
         :param use_catboost: данные готовятся для catboost
@@ -103,69 +110,20 @@ class DataTransform:
         self.use_catboost = use_catboost
         self.category_columns = [] if category_columns is None else category_columns
         self.numeric_columns = [] if numeric_columns is None else numeric_columns
-        self.drop_first = drop_first
+        self.features2drop = [] if features2drop is None else features2drop
         self.exclude_columns = []
-        self.new_columns = []
-        self.comment = {'drop_first': drop_first}
-        self.transform_columns = None
+        self.comment = {}
+        self.preprocessor = None
         self.scaler = scaler
         self.args_scaler = args_scaler
         self.preprocess_path_file = 'reprocess_data.pkl'
         self.aggregate_path_file = 'aggregate_data.pkl'
         self.agg_df = pd.DataFrame()
 
-    def cat_dummies(self, df):
-        """
-        Отметка категориальных колонок --> str для catboost
-        OneHotEncoder для остальных
-        :param df: ДФ
-        :return: ДФ с фичами
-        """
-        # если нет цифровых колонок --> заполним их
-        if self.category_columns and not self.numeric_columns:
-            self.numeric_columns = [col_name for col_name in df.columns
-                                    if col_name not in self.category_columns]
-        # если нет категориальных колонок --> заполним их
-        if self.numeric_columns and not self.category_columns:
-            self.category_columns = [col_name for col_name in df.columns
-                                     if col_name not in self.numeric_columns]
-
+    def set_category(self, df):
         for col_name in self.category_columns:
             if col_name in df.columns:
-                if self.use_catboost:
-                    df[col_name] = df[col_name].astype(str)
-                else:
-                    print(f'Трансформирую колонку: {col_name}')
-                    # Create dummy variables
-                    df = pd.get_dummies(df, columns=[col_name], drop_first=self.drop_first)
-
-                    self.new_columns.extend([col for col in df.columns
-                                             if col.startswith(col_name)])
-        return df
-
-    def apply_scaler(self, df):
-        """
-        Масштабирование цифровых колонок
-        :param df: исходный ДФ
-        :return: нормализованный ДФ
-        """
-        if not self.transform_columns:
-            self.transform_columns = self.numeric_columns
-        if self.scaler and self.transform_columns:
-            print(f'Применяю scaler: {self.scaler.__name__} '
-                  f'с аргументами: {self.args_scaler}')
-            args = self.args_scaler if self.args_scaler else tuple()
-            scaler = self.scaler(*args)
-            scaled_data = scaler.fit_transform(df[self.transform_columns])
-            if scaled_data.shape[1] != len(self.transform_columns):
-                print(f'scaler породил: {scaled_data.shape[1]} колонок')
-                new_columns = [f'pnf_{n:02}' for n in range(scaled_data.shape[1])]
-                df = pd.concat([df, pd.DataFrame(scaled_data, columns=new_columns)], axis=1)
-                self.exclude_columns.extend(self.transform_columns)
-            else:
-                df[self.transform_columns] = scaled_data
-
-            self.comment.update(scaler=self.scaler.__name__, args_scaler=self.args_scaler)
+                df[col_name] = df[col_name].astype('category')
         return df
 
     def fit(self, df):
@@ -174,29 +132,63 @@ class DataTransform:
         :param df: исходный ФД
         :return: ДФ с агрегациями
         """
+        # если нет цифровых колонок --> заполним их
+        if self.category_columns and not self.numeric_columns:
+            self.numeric_columns = [col_name for col_name in df.columns if col_name
+                                    not in self.category_columns + self.features2drop]
+        # если нет категориальных колонок --> заполним их
+        if self.numeric_columns and not self.category_columns:
+            self.category_columns = [col_name for col_name in df.columns if col_name
+                                     not in self.numeric_columns + self.features2drop]
+
         start_time = print_msg('Группировка по целевому признаку...')
 
         self.agg_df = df.pivot_table(index='model',
                                      columns='target_class',
-                                     values=['car_rating', 'year_to_work', 'riders'],
+                                     values=['car_rating', 'year_to_work', 'riders',
+                                             # 'target_reg',
+                                             ],
                                      aggfunc=[
-                                         'median',
-                                         'mean'
+                                         np.mean,
+                                         np.median,
+                                         # np.std,
+                                         # pd.Series.skew,
                                      ]).fillna(0)
         self.agg_df.columns = [f'{i[2]}_{i[1]}_{i[0]}_tenc' for i in self.agg_df.columns]
         self.agg_df.reset_index(inplace=True)
 
         grp = df.pivot_table(index='model',
                              columns='target_class',
-                             values=['car_id'],
+                             values=['fuel_type'],
                              aggfunc=['count']).fillna(0).astype(int)
         grp.columns = [f'{i[2]}_{i[0]}_tenc' for i in grp.columns]
         grp.reset_index(inplace=True)
 
-        self.agg_df = self.agg_df.merge(grp, on='model', how='left')
+        # self.agg_df = self.agg_df.merge(grp, on='model', how='left')
 
         # Удаляем константные колонки
         self.agg_df = self.drop_constant_columns(self.agg_df)
+
+        # Обучение ColumnTransformer
+        if self.use_catboost:
+            df = self.set_category(df.drop(columns=self.features2drop, errors='ignore'))
+        else:
+            categorical_transformer = Pipeline(steps=[
+                ("onehot",
+                 OneHotEncoder(dtype=int, handle_unknown="ignore"))])
+
+            numerical_transformer = Pipeline(steps=[
+                ("scaler",
+                 FunctionTransformer(lambda Z: Z) if self.scaler is None else self.scaler())
+            ])
+
+            # соединим два предыдущих трансформера в один
+            self.preprocessor = ColumnTransformer(transformers=[
+                ("numerical", numerical_transformer, self.numeric_columns),
+                ("categorical", categorical_transformer, self.category_columns)])
+
+            # Обучаем препроцессор на данных train
+            self.preprocessor.fit(df.copy())
 
         print_time(start_time)
 
@@ -209,20 +201,36 @@ class DataTransform:
         :param model_columns: список колонок, которые будут использованы в модели
         :return: ДФ с фичами
         """
-        print(self.agg_df.info(), df.info())
-        print(self.agg_df.isna().sum().sum(), df.isna().sum().sum())
+        # Сохраняем исходный индекс ДФ
+        original_index = df.index
 
         if not self.agg_df.empty:
-            df = df.merge(self.agg_df, on='model', how='left')
+            df = df.reset_index(names='car_id').merge(self.agg_df, on='model', how='left')
+            df.set_index('car_id', inplace=True)
 
-        df = self.cat_dummies(df)
+        if self.use_catboost:
+            df = self.set_category(df.copy())
+        else:
+            # Трансформируем данные
+            preprocessed = self.preprocessor.transform(df.copy())
 
-        df = self.apply_scaler(df)
+            # Получаем имена новых колонок после трансформации
+            if self.scaler:
+                new_num_cols = self.preprocessor.named_transformers_["numerical"].named_steps[
+                    "scaler"].get_feature_names_out(self.numeric_columns)
+            else:
+                new_num_cols = self.numeric_columns
+
+            new_cat_cols = self.preprocessor.named_transformers_["categorical"].named_steps[
+                "onehot"].get_feature_names_out(self.category_columns)
+
+            model_columns = list(new_num_cols) + list(new_cat_cols)
+
+            # Преобразуем в DataFrame
+            df = pd.DataFrame(preprocessed, columns=model_columns, index=original_index)
 
         if model_columns is None:
             model_columns = df.columns.tolist()
-
-        model_columns.extend(self.new_columns)
 
         exclude_columns = [col for col in self.exclude_columns if col in df.columns]
         exclude_columns.extend(col for col in df.columns if col not in model_columns)
@@ -248,7 +256,7 @@ class DataTransform:
         df = self.transform(df, model_columns=model_columns)
         return df
 
-    def preprocess_data(self, fill_nan=True, remake_file=False):
+    def preprocess_data(self, fill_nan=True, remake_file=False, **kwargs):
         """
         Предобработка данных
         :param fill_nan: заполняем пропуски в данных
@@ -392,7 +400,7 @@ class DataTransform:
         return df
 
     def make_agg_data(self, remake_file=False, use_featuretools=False,
-                      file_with_target_class=None):
+                      file_with_target_class=None, **kwargs):
         """
         Подсчет разных агрегированных статистик
         :param remake_file: Формируем файлы снова или читаем с диска
@@ -416,6 +424,10 @@ class DataTransform:
                 train_df, test_df = joblib.load(in_file)
             if file_with_target_class is None:
                 test_df.drop(columns=['target_class'], inplace=True, errors='ignore')
+
+            self.category_columns.extend([col for col in test_df.columns
+                                          if col.upper().startswith('MODE_')
+                                          and col not in self.category_columns])
             print_time(start_time)
             return train_df, test_df
 
@@ -425,6 +437,7 @@ class DataTransform:
         start_time = print_msg('Агрегация данных...')
 
         if use_featuretools:
+            self.comment = {'use_featuretools': True}
             all_data = pd.concat([train[test.columns], test], ignore_index=True)
 
             # Создаём отношения между источниками данных
@@ -568,6 +581,12 @@ class DataTransform:
         else:
             test_df.drop(columns=['target_class'], inplace=True, errors='ignore')
 
+        train_df.set_index('car_id', inplace=True)
+        test_df.set_index('car_id', inplace=True)
+
+        self.category_columns.extend([col for col in test_df.columns
+                                      if col.upper().startswith('MODE_')
+                                      and col not in self.category_columns])
         print_time(start_time)
 
         if self.aggregate_path_file:
@@ -1021,25 +1040,29 @@ if __name__ == "__main__":
 
     # тут разные опыты с классом...
 
-    # dts = DataTransform()
-    #
-    # # train_data, test_data = dts.make_agg_data(remake_file=True, use_featuretools=True)
-    # train_data, test_data = dts.make_agg_data(remake_file=True,
-    #                                           file_with_target_class='cb_submit_074_local.csv')
-    #
-    # print(train_data.columns)
-    #
-    # df = dts.fit(train_data)
-    # print(df.columns)
-    #
-    # train_data = dts.fit_transform(train_data)
-    # test_data = dts.transform(test_data)
-    #
-    # print(set(train_data.columns) - set(test_data.columns))
+    dts = DataTransform()
+
+    # train_data, test_data = dts.make_agg_data(remake_file=True, use_featuretools=True)
+    train_data, test_data = dts.make_agg_data(
+        remake_file=True,
+        # use_featuretools=True,
+        file_with_target_class='cb_submit_074_local.csv',
+    )
+
+    print(train_data.columns)
+
+    df = dts.fit(train_data)
+    print(df.columns)
+
+    train_data = dts.fit_transform(train_data)
+    test_data = dts.transform(test_data)
+
+    print(train_data.shape, test_data.shape)
+
+    print(set(train_data.columns) - set(test_data.columns))
 
     # files = [Path(fil).name for fil in glob(str(PREDICTIONS_DIR.joinpath('merge')) + '/*.*')]
     # print(files)
-    #
     # merge_submits(max_num=files, submit_prefix='mg_', post_fix='_reg')
 
     merge_submits(max_num=54, submit_prefix='cbm_', post_fix='_reg')

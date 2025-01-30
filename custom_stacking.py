@@ -22,11 +22,16 @@ from set_all_seeds import set_all_seeds
 __import__("warnings").filterwarnings('ignore')
 
 
+def custom_rmse(y_true, y_pred):
+    return mean_squared_error(y_true, y_pred, squared=False)
+
+
 class CustomStackingRegressor:
     def __init__(self, estimators, final_estimator=None, test_size=0.2, stratified=None,
                  cv_folds=None, cv_folds_meta=None, num_scaler=None, models_to_scale=None,
                  model_columns=None, cat_columns=None, num_columns=None, meta_columns=None,
-                 features2drop=None, pred_proba=False, n_jobs=-1, verbose=False, **kwargs):
+                 features2drop=None, pred_proba=False, oof_pred_bag=True, metric=None,
+                 n_jobs=-1, verbose=False, **kwargs):
         """
         Инициализация класса
         :param estimators: список моделей, состоящий из кортежей (имя, модель)
@@ -43,6 +48,7 @@ class CustomStackingRegressor:
         :param meta_columns: список колонок из исходного датасета, которые пойдут в стекинг
         :param features2drop: список для удаления
         :param pred_proba: использовать для предсказаний вероятности
+        :param oof_pred_bag: предсказания теста усредняются по фолдам / или на всем трейне
         :param n_jobs:
         :param verbose:
         :param kwargs:
@@ -65,6 +71,8 @@ class CustomStackingRegressor:
         self.meta_columns = meta_columns
         self.features2drop = features2drop
         self.pred_proba = pred_proba
+        self.oof_pred_bag = oof_pred_bag
+        self.metric = metric
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.random_state = kwargs.get('random_state', 127)
@@ -78,11 +86,16 @@ class CustomStackingRegressor:
         self.show_min_output = kwargs.get('show_min_output', False)
         set_all_seeds(seed=self.random_state)
 
-    def fit_model(self, model_name, base_model, split, n_fold=0):
-        name_fold = f', фолд: {n_fold}/{self.cv_folds}' if n_fold else ''
-
-        if self.show_min_output:
-            print(f'Обучаю модель: {model_name}{name_fold}')
+    def fit_model(self, model_name, base_model, split, n_fold=0, cv_folds=None):
+        """
+        Функция обучения модели
+        :param model_name: Имя модели
+        :param base_model: Экземпляр класса модели
+        :param split: Кортеж с данными (X_train, X_valid, y_train, y_valid)
+        :param n_fold: номер фолда
+        :param cv_folds: общее количество фолдов
+        :return: обученная модель
+        """
 
         X_train, X_valid, y_train, y_valid = split
         model = clone(base_model)
@@ -109,9 +122,32 @@ class CustomStackingRegressor:
             model.fit(X_train, y_train,
                       )
 
+        score_ = None
+        if self.show_min_output:
+            if cv_folds is None:
+                cv_folds = self.cv_folds
+            metric = ''
+            name_fold = f', фолд: {n_fold}/{cv_folds}' if n_fold else ''
+            if all(obj is not None for obj in (self.metric, X_valid, y_valid)):
+                y_pred = model.predict(X_valid)
+                score_ = self.metric(y_valid, y_pred)
+                metric = f', [metric={score_:.3f}]'
+            print(f'Обучаю модель: {model_name}{name_fold}{metric}')
+        if not hasattr(model, 'metric_score_'):
+            setattr(model, 'metric_score_', score_)
         return model
 
     def process_data(self, model_name, X_train, X_valid=None, y_train=None, y_valid=None):
+        """
+        Функция подготовки данных для моделей: бустингам обрабатывать не требуется,
+        для остальных моделей onehot-енкодинг и применение скейлера, если требуется
+        :param model_name: Имя модели
+        :param X_train:
+        :param X_valid:
+        :param y_train:
+        :param y_valid:
+        :return: кортеж предобработанных данных
+        """
         if model_name in ("CatBoost", "LightGBM", "XGBoost"):
             return X_train, X_valid, y_train, y_valid
 
@@ -137,23 +173,44 @@ class CustomStackingRegressor:
                 valid_[num_columns_trn] = X_valid[num_columns_trn]
         return train_, valid_, y_train, y_valid
 
-    def get_split_folds(self, X):
+    def get_split_folds(self, X, cv_folds=None):
+        """
+        Получение итератора с индексами разбиения теста на фолды
+        :param X: Тренировочный датасет
+        :param cv_folds: количество фолдов
+        :return: Итератор
+        """
+        if cv_folds is None:
+            cv_folds = self.cv_folds
         if self.stratified:
-            skf = StratifiedKFold(n_splits=self.cv_folds, random_state=self.random_state,
+            skf = StratifiedKFold(n_splits=cv_folds, random_state=self.random_state,
                                   shuffle=True)
             skf_folds = skf.split(X, self.stratified_target)
         else:
-            split_kf = KFold(n_splits=self.cv_folds, random_state=self.random_state,
-                             shuffle=True)
+            split_kf = KFold(n_splits=cv_folds, random_state=self.random_state, shuffle=True)
             skf_folds = split_kf.split(X)
         return skf_folds
 
-    def get_new_columns(self, model_name, make_proba=False):
+    def get_new_columns(self, model_name: str, make_proba=False):
+        """
+        Формирование имени колонок с предсказаниями модели первого уровня
+        :param model_name: Имя модели
+        :param make_proba: Для вероятностей формируется список колонок по количеству классов
+        :return: Имя одной колонки или список
+        """
         if self.pred_proba or make_proba:
             return [f'{model_name}_{label}' for label in self.y_train_for_meta.unique()]
         return model_name
 
     def fit(self, X, y, verbose=None, **kwargs):
+        """
+        Обучение моделей первого уровня
+        :param X: Тренировочный датасет
+        :param y: целевая переменная
+        :param verbose: уровень логгирования
+        :param kwargs: словарь с параметрами для совместимости
+        :return: self
+        """
         if verbose:
             self.verbose = verbose
 
@@ -183,7 +240,7 @@ class CustomStackingRegressor:
             new_columns = self.get_new_columns(model_name)
             df = pd.DataFrame(index=X.index)
             df[new_columns] = 0
-
+            scores = []
             if self.cv_folds:
                 skf_folds = self.get_split_folds(X)
 
@@ -194,22 +251,20 @@ class CustomStackingRegressor:
                     split = self.process_data(model_name, X_train, X_valid, y_train, y_valid)
                     model = self.fit_model(model_name, base_model, split, idx)
                     self.fitted_models[model_name].append(model)
+                    scores.append(getattr(model, 'metric_score_', 0))
 
                     X_train_pd, X_valid_pd, y_train_pd, y_valid_pd = split
                     if model_name in ("TabNetWork",):
-                        if self.pred_proba:
-                            y_pred_valid = model.predict_proba(X_valid_pd.values)
-                        else:
-                            y_pred_valid = model.predict(X_valid_pd.values)
+                        X_valid_pd_values = X_valid_pd.values
                     else:
-                        if self.pred_proba:
-                            y_pred_valid = model.predict_proba(X_valid_pd)
-                        else:
-                            y_pred_valid = model.predict(X_valid_pd)
+                        X_valid_pd_values = X_valid_pd.copy()
                     if self.pred_proba:
+                        y_pred_valid = model.predict_proba(X_valid_pd_values)
                         df.iloc[valid_id, :] = y_pred_valid
                     else:
+                        y_pred_valid = model.predict(X_valid_pd_values)
                         df.iloc[valid_id, 0] = y_pred_valid
+
             else:
                 split = train_test_split(X[self.model_columns], y,
                                          test_size=self.test_size,
@@ -220,17 +275,20 @@ class CustomStackingRegressor:
                 full_train, *_ = self.process_data(model_name, X[self.model_columns])
                 model = self.fit_model(model_name, base_model, split)
                 self.fitted_models[model_name].append(model)
+                scores.append(getattr(model, 'metric_score_', 0))
+
                 if model_name in ("TabNetWork",):
-                    if self.pred_proba:
-                        predict_full_train = model.predict_proba(full_train.values)
-                    else:
-                        predict_full_train = model.predict(full_train.values)
+                    full_train_values = full_train.values
                 else:
-                    if self.pred_proba:
-                        predict_full_train = model.predict_proba(full_train)
-                    else:
-                        predict_full_train = model.predict(full_train)
+                    full_train_values = full_train.copy()
+                if self.pred_proba:
+                    predict_full_train = model.predict_proba(full_train_values)
+                else:
+                    predict_full_train = model.predict(full_train_values)
                 df[new_columns] = predict_full_train
+
+            if self.show_min_output and all(scores):
+                print(f'Модель: {model_name}, [mean={np.mean(scores):.3f}]')
 
             self.X_train_for_meta = pd.concat([self.X_train_for_meta, df], axis=1)
 
@@ -240,55 +298,25 @@ class CustomStackingRegressor:
 
         return self
 
-    def predict(self, test, save_to_excel=False):
-        # Получаем предсказания на тестовой выборке
-        self.X_test_for_meta = pd.DataFrame(index=test.index)
-        for model_name, models_list in self.fitted_models.items():
-            test_prep, *_ = self.process_data(model_name, test[self.model_columns])
+    def fit_predict_meta_model(self, test, predict_columns):
+        """
+        Обучение метамодели и получение от неё предсказаний
+        :param test: Тестовый датасет
+        :param predict_columns: Список с именами колонок в которые будут записаны предсказания
+        :return: Предсказания метамодели
+        """
 
-            # Инициализация массива для хранения предсказаний всех моделей
-            predictions_array = np.zeros((len(test_prep), len(models_list)))
-
-            # Сбор предсказаний от каждой модели
-            for idx, model in enumerate(models_list):
-                if model_name in ("TabNetWork",):
-                    pred_test_prep = model.predict(test_prep.values)
-                else:
-                    pred_test_prep = model.predict(test_prep)
-
-                # Сохраняем предсказания в массив
-                predictions_array[:, idx] = pred_test_prep
-
-            new_columns = self.get_new_columns(model_name)
-            # Вычисление статистик по строкам: можно попробовать еще медиану !!!
-            df = pd.DataFrame(data=predictions_array.mean(axis=1),
-                              columns=[new_columns],
-                              index=test.index)
-
-            self.X_test_for_meta = pd.concat([self.X_test_for_meta, df], axis=1)
-
-        if self.meta_columns is not None:
-            X_raw, *_ = self.process_data(self.final_estimator_name, test[self.meta_columns])
-            self.X_test_for_meta = pd.concat([self.X_test_for_meta, X_raw], axis=1)
-
-        # Обучаем метамодель
-        predict_columns = self.get_new_columns('predict')
         result = pd.DataFrame(index=test.index)
-
-        if save_to_excel:
-            train_for_meta = pd.concat([self.X_train_for_meta, self.y_train_for_meta], axis=1)
-            train_for_meta.to_excel(WORK_PATH.joinpath('X_train_for_meta.xlsx'))
-            self.X_test_for_meta.to_excel(WORK_PATH.joinpath('X_test_for_meta.xlsx'))
-
-        XM = self.X_train_for_meta
-        yM = self.y_train_for_meta
+        XM = self.X_train_for_meta.copy()
+        yM = self.y_train_for_meta.copy()
+        scores = []
 
         if self.cv_folds_meta:
             # Инициализация массива для хранения предсказаний всех моделей
             predictions_array = np.zeros((len(self.X_test_for_meta), self.cv_folds_meta))
-
-            skf_folds = self.get_split_folds(XM)
+            skf_folds = self.get_split_folds(XM, self.cv_folds_meta)
             for idx, (train_idx, valid_idx) in enumerate(skf_folds, 1):
+
                 X_train, y_train = XM.iloc[train_idx], yM.iloc[train_idx]
                 X_valid, y_valid = XM.iloc[valid_idx], yM.iloc[valid_idx]
 
@@ -296,11 +324,12 @@ class CustomStackingRegressor:
 
                 self.final_model = self.fit_model(self.final_estimator_name,
                                                   self.final_estimator,
-                                                  split, idx)
+                                                  split, idx, self.cv_folds_meta)
 
                 pred_test_prep = self.final_model.predict(self.X_test_for_meta)
                 # Сохраняем предсказания в массив
                 predictions_array[:, idx - 1] = pred_test_prep
+                scores.append(getattr(self.final_model, 'metric_score_', 0))
 
             # Вычисление статистик по строкам
             result = pd.DataFrame(data=predictions_array.mean(axis=1),
@@ -315,6 +344,65 @@ class CustomStackingRegressor:
                                               self.final_estimator,
                                               split)
             result[predict_columns] = self.final_model.predict(self.X_test_for_meta)
+            scores.append(getattr(self.final_model, 'metric_score_', 0))
+
+        if self.show_min_output and all(scores):
+            print(f'Модель: {self.final_estimator_name}, [mean={np.mean(scores):.3f}]')
+
+        return result
+
+    def predict(self, test, save_to_excel=False):
+        """
+        Получение предсказаний от моделей первого уровня,
+        вызов функции обучения метамодели и получение от неё предсказаний
+        :param test: Тестовый датасет
+        :param save_to_excel: Сохранять результаты стекинга моделей первого уровня:
+                              требуется для подбора гиперпараметров метамодели
+        :return: предсказания метамодели
+        """
+        # Получаем предсказания на тестовой выборке
+        self.X_test_for_meta = pd.DataFrame(index=test.index)
+        for model_name, models_list in self.fitted_models.items():
+            test_prep, *_ = self.process_data(model_name, test[self.model_columns])
+
+            # Инициализация массива для хранения предсказаний всех моделей
+            predictions_array = np.zeros((len(test_prep), len(models_list)))
+
+            # Сбор предсказаний от каждой модели, обученной по фолдам
+            for idx, model in enumerate(models_list):
+                if model_name in ("TabNetWork",):
+                    pred_test_prep = model.predict(test_prep.values)
+                else:
+                    pred_test_prep = model.predict(test_prep)
+
+                # Сохраняем предсказания в массив
+                predictions_array[:, idx] = pred_test_prep
+
+            new_columns = self.get_new_columns(model_name)
+
+            if self.oof_pred_bag:
+                # Вычисление статистик по строкам: можно попробовать еще медиану !!!
+                preds = predictions_array.mean(axis=1)
+            else:
+                # Берем предсказания одной последней модели
+                preds = predictions_array[:, -1]
+            # Создаем из него ДФ
+            df = pd.DataFrame(data=preds, columns=[new_columns], index=test.index)
+            # Добавляем ДФ к результатам
+            self.X_test_for_meta = pd.concat([self.X_test_for_meta, df], axis=1)
+
+        if self.meta_columns is not None:
+            X_raw, *_ = self.process_data(self.final_estimator_name, test[self.meta_columns])
+            self.X_test_for_meta = pd.concat([self.X_test_for_meta, X_raw], axis=1)
+
+        if save_to_excel:
+            train_for_meta = pd.concat([self.X_train_for_meta, self.y_train_for_meta], axis=1)
+            train_for_meta.to_excel(WORK_PATH.joinpath('X_train_for_meta.xlsx'))
+            self.X_test_for_meta.to_excel(WORK_PATH.joinpath('X_test_for_meta.xlsx'))
+
+        # Обучение и получение предсказаний мета модели
+        predict_columns = self.get_new_columns('predict')
+        result = self.fit_predict_meta_model(test, predict_columns)
 
         self.X_test_for_meta[predict_columns] = result[predict_columns]
 
@@ -398,6 +486,7 @@ class CustomStackingClassifier(CustomStackingRegressor):
                     self.X_test_for_meta)
 
             result[predict_columns] /= self.cv_folds_meta
+
         else:
             split = train_test_split(XM, yM, test_size=self.test_size,
                                      stratify=self.stratified_target,

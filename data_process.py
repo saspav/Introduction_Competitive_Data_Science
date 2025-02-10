@@ -597,6 +597,24 @@ class DataTransform:
 
         return train_df, test_df
 
+    @staticmethod
+    def add_to_train_pl(train_df, test_df, file_pseudo_labels=None):
+        """
+        Добавление в трейн тестовый датасет с псевдометками
+        :param train_df:
+        :param test_df:
+        :param file_pseudo_labels: Используем Псевдолейблинг для регресии
+        :return:
+        """
+        if PREDICTIONS_DIR.joinpath(file_pseudo_labels).is_file():
+            pl_df = pd.read_csv(PREDICTIONS_DIR.joinpath(file_pseudo_labels),
+                                index_col=['car_id'])
+            test = test_df.copy()
+            test = test.merge(pl_df, how='left', left_index=True, right_index=True)
+            train_df = pd.concat([train_df, test], axis=0)
+
+        return train_df
+
 
 def set_all_seeds(seed=RANDOM_SEED):
     # python's seeds
@@ -912,11 +930,15 @@ def add_info_to_log(prf, max_num, idx_fold, model, valid_scores, info_cols,
         model_clf_lr = model.get_params().get('learning_rate', 0)
 
     if feature_imp is not None:
-        use_cols = [col for col in model_columns if col not in exclude_columns]
-        features = pd.DataFrame({'Feature': use_cols,
-                                 'Importance': feature_imp}).sort_values('Importance',
-                                                                         ascending=False)
-        features.to_excel(MODEL_PATH.joinpath(f'features_{prf}{max_num}.xlsx'), index=False)
+        try:
+            use_cols = [col for col in model_columns if col not in exclude_columns]
+            features = pd.DataFrame({'Feature': use_cols,
+                                     'Importance': feature_imp}).sort_values('Importance',
+                                                                             ascending=False)
+            features.to_excel(MODEL_PATH.joinpath(f'features_{prf}{max_num}.xlsx'),
+                              index=False)
+        except:
+            pass
 
     if model_clf_lr is not None:
         model_clf_lr = round(model_clf_lr, 8)
